@@ -136,6 +136,47 @@ class LightweightGliomaDataset(Dataset):
         
         return X, Y
 
+# -------------------- DICE LOSS FUNCTION --------------------
+def dice_loss(pred, target, num_classes, smooth=1e-6):
+    """Calculate dice loss for segmentation"""
+    # Convert predictions to probabilities
+    pred = F.softmax(pred, dim=1)
+    
+    # Convert target to one-hot if needed
+    if target.ndim == 4:  # If target is class indices
+        target_one_hot = torch.zeros_like(pred)
+        target_one_hot.scatter_(1, target.unsqueeze(1), 1)
+        target = target_one_hot
+    
+    dice_loss_total = 0.0
+    for cls in range(num_classes):
+        pred_cls = pred[:, cls]
+        target_cls = target[:, cls]
+        intersection = (pred_cls * target_cls).sum()
+        union = pred_cls.sum() + target_cls.sum()
+        dice = (2. * intersection + smooth) / (union + smooth)
+        dice_loss_total += 1 - dice
+    
+    return dice_loss_total / num_classes
+
+# -------------------- COMBINED LOSS FUNCTION --------------------
+def combined_loss(pred, target, num_classes, alpha=0.5, smooth=1e-6):
+    """Combined CrossEntropy and Dice loss"""
+    # Prepare target for CrossEntropy
+    if target.ndim == 5:
+        target_ce = torch.argmax(target, dim=1)
+    else:
+        target_ce = target
+    
+    # Calculate CrossEntropy loss
+    ce_loss = F.cross_entropy(pred, target_ce)
+    
+    # Calculate Dice loss
+    d_loss = dice_loss(pred, target_ce, num_classes, smooth)
+    
+    # Combined loss
+    return alpha * ce_loss + (1 - alpha) * d_loss
+
 # -------------------- DICE SCORE CALCULATION --------------------
 def dice_score(pred, target, num_classes, smooth=1e-6):
     """Calculate dice score for segmentation"""
@@ -203,8 +244,7 @@ learning_rate = 0.001
 patch_size = (64, 64, 64)  # Smaller patches
 max_patches_per_volume = 2  # Fewer patches per volume
 
-# Loss function and optimizer
-loss_fn = torch.nn.CrossEntropyLoss()
+# Combined loss function and optimizer
 optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-4)
 # scheduler = ReduceLROnPlateau(optimizer, mode='max', factor=0.7, patience=3, verbose=True)
 scheduler = ReduceLROnPlateau(optimizer, mode='max', factor=0.7, patience=3)
@@ -259,7 +299,8 @@ with mlflow.start_run():
         "patch_size": patch_size,
         "max_patches_per_volume": max_patches_per_volume,
         "total_parameters": total_params,
-        "device": str(device)
+        "device": str(device),
+        "loss_function": "combined_ce_dice"
     })
     
     for epoch in range(epochs):
@@ -278,12 +319,8 @@ with mlflow.start_run():
             # Forward pass (no mixed precision for CPU)
             output = model(X)
             
-            # Prepare target
-            if Y.ndim == 5:
-                Y = torch.argmax(Y, dim=1)
-            
-            # Calculate loss
-            loss = loss_fn(output, Y)
+            # Calculate combined loss
+            loss = combined_loss(output, Y, num_classes=4, alpha=0.5)
             
             # Backward pass
             loss.backward()
@@ -310,11 +347,8 @@ with mlflow.start_run():
                 
                 output = model(X)
                 
-                if Y.ndim == 5:
-                    Y = torch.argmax(Y, dim=1)
-                
                 # Calculate metrics
-                loss = loss_fn(output, Y)
+                loss = combined_loss(output, Y, num_classes=4, alpha=0.5)
                 dice = dice_score(output, Y, num_classes=4)
                 
                 val_loss += loss.item()
@@ -396,9 +430,6 @@ def evaluate_on_test_set():
             X, Y = X.to(device), Y.to(device)
             output = model(X)
             
-            if Y.ndim == 5:
-                Y = torch.argmax(Y, dim=1)
-            
             dice = dice_score(output, Y, num_classes=4)
             test_dice += dice.item()
             test_batches += 1
@@ -411,4 +442,4 @@ def evaluate_on_test_set():
     return avg_test_dice
 
 # Uncomment the line below to run test evaluation
-# evaluate_on_test_set()
+evaluate_on_test_set()
