@@ -1,1 +1,2 @@
 # light_weight_models_for_brain_tumor_segmentation
+model_five.py : export KMP_DUPLICATE_LIB_OK=TRUE
