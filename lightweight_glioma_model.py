@@ -10,9 +10,7 @@ import mlflow.pytorch
 import time
 from tqdm import tqdm
 from torch.optim.lr_scheduler import ReduceLROnPlateau
-from scipy.ndimage import rotate, zoom
-from scipy.ndimage import gaussian_filter
-import random
+from scipy.ndimage import rotate
 
 # -------------------- MEMORY MANAGEMENT --------------------
 def clear_memory():
@@ -21,38 +19,35 @@ def clear_memory():
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-# -------------------- DATA AUGMENTATION FUNCTIONS --------------------
-def augment_volume(volume, mask):
-    """Apply light data augmentation to volume and mask"""
-    # Convert to numpy if tensor
-    if torch.is_tensor(volume):
-        volume = volume.numpy()
-    if torch.is_tensor(mask):
-        mask = mask.numpy()
-    
-    # Only apply ONE augmentation per sample to avoid corruption
-    aug_choice = random.choice([0, 1, 2, 3])  # 0=none, 1=flip, 2=rotate, 3=intensity
-    
-    if aug_choice == 1:  # Random flipping
-        axis = random.choice([1, 2, 3])  # Skip channel dimension
-        volume = np.flip(volume, axis=axis)
-        mask = np.flip(mask, axis=axis)
-    
-    elif aug_choice == 2:  # Small rotation
-        angle = random.uniform(-5, 5)  # Much smaller rotation
-        axes = random.choice([(1, 2), (2, 3)])  # Only safer axes
-        volume = rotate(volume, angle, axes=axes, reshape=False, order=1)
-        mask = rotate(mask, angle, axes=axes, reshape=False, order=0)
-    
-    elif aug_choice == 3:  # Light intensity augmentation
-        brightness_factor = random.uniform(0.9, 1.1)  # Much more conservative
-        volume = volume * brightness_factor
-    
-    # Ensure contiguous arrays to avoid negative stride issues
-    volume = np.ascontiguousarray(volume)
-    mask = np.ascontiguousarray(mask)
-    
-    return volume, mask
+# -------------------- DATA AUGMENTATION --------------------
+def gamma_correction(image, gamma):
+    return np.clip(image ** gamma, 0, 1)
+
+def augment_image(image, mask, is_training=True):
+    if is_training:
+        # Rotation
+        angle = np.random.uniform(-15, 15)
+        image = rotate(image, angle, axes=(0, 1), reshape=False, mode='reflect')
+        mask = rotate(mask, angle, axes=(0, 1), reshape=False, mode='reflect')
+      
+        # Flipping
+        if np.random.rand() > 0.5:
+            image, mask = np.flip(image, axis=0).copy(), np.flip(mask, axis=0).copy()
+        if np.random.rand() > 0.5:
+            image, mask = np.flip(image, axis=1).copy(), np.flip(mask, axis=1).copy()
+
+        # Brightness Adjustment
+        brightness = np.random.uniform(0.9, 1.1)
+        image = np.clip(image * brightness, 0, 1)
+        # Noise Addition (Gaussian noise)
+        if np.random.rand() > 0.5:
+            noise = np.random.normal(0, 0.02, image.shape)
+            image = np.clip(image + noise, 0, 1)
+        # Gamma Correction
+        if np.random.rand() > 0.5:
+            gamma = np.random.uniform(0.8, 1.2)
+            image = gamma_correction(image, gamma)
+    return image, mask
 
 # -------------------- LIGHTWEIGHT 3D UNET MODEL --------------------
 class ConvBlock3D(nn.Module):
@@ -72,7 +67,7 @@ class ConvBlock3D(nn.Module):
 
 class LightweightUNet3D(nn.Module):
     """Very lightweight 3D U-Net for low-memory systems"""
-    def __init__(self, in_channels=4, out_channels=4, base_channels=12):  # Changed to 12 (compromise)
+    def __init__(self, in_channels=4, out_channels=4, base_channels=8):
         super().__init__()
         
         # Encoder (downsampling path)
@@ -117,14 +112,14 @@ class LightweightUNet3D(nn.Module):
 
 # -------------------- MEMORY-EFFICIENT DATASET --------------------
 class LightweightGliomaDataset(Dataset):
-    """Memory-efficient dataset with patch extraction and augmentation"""
-    def __init__(self, img_dir, img_list, mask_dir, mask_list, patch_size=(80, 80, 80),  # Changed to 80 (compromise)
-                 max_patches_per_volume=4, augment=False):  # Added augment parameter
+    """Memory-efficient dataset with patch extraction"""
+    def __init__(self, img_dir, img_list, mask_dir, mask_list, patch_size=(64, 64, 64), 
+                 max_patches_per_volume=4, is_training=False):
         self.img_paths = [os.path.join(img_dir, f) for f in sorted(img_list)]
         self.mask_paths = [os.path.join(mask_dir, f) for f in sorted(mask_list)]
         self.patch_size = patch_size
         self.max_patches = max_patches_per_volume
-        self.augment = augment
+        self.is_training = is_training
         
     def __len__(self):
         return len(self.img_paths) * self.max_patches
@@ -160,16 +155,12 @@ class LightweightGliomaDataset(Dataset):
         X = np.load(self.img_paths[volume_idx])  # (D, H, W, C)
         Y = np.load(self.mask_paths[volume_idx]) # (D, H, W, C)
         
+        # Apply augmentation
+        X, Y = augment_image(X, Y, is_training=self.is_training)
+        
         # Convert to tensor and move channels first
         X = torch.tensor(X, dtype=torch.float32).permute(3, 0, 1, 2)  # (C, D, H, W)
         Y = torch.tensor(Y, dtype=torch.float32).permute(3, 0, 1, 2)  # (C, D, H, W)
-        
-        # Apply augmentation if enabled
-        if self.augment:
-            X, Y = augment_volume(X, Y)
-            # Convert back to tensors
-            X = torch.tensor(X, dtype=torch.float32)
-            Y = torch.tensor(Y, dtype=torch.float32)
         
         # Extract patches
         X = self.extract_patch(X, self.patch_size, patch_idx)
@@ -276,8 +267,8 @@ mlflow.set_experiment("lightweight-glioma-segmentation")
 device = torch.device("cpu")
 print(f"Using device: {device}")
 
-# Create lightweight model with increased capacity
-model = LightweightUNet3D(in_channels=4, out_channels=4, base_channels=12).to(device)  # Changed to 12
+# Create lightweight model
+model = LightweightUNet3D(in_channels=4, out_channels=4, base_channels=8).to(device)
 total_params = sum(p.numel() for p in model.parameters())
 print(f"Model parameters: {total_params:,}")
 
@@ -285,29 +276,31 @@ print(f"Model parameters: {total_params:,}")
 epochs = 30
 batch_size = 1  # Very small batch size for memory safety
 learning_rate = 0.001
-patch_size = (80, 80, 80)  # Changed to 80 (compromise)
+patch_size = (64, 64, 64)  # Smaller patches
 max_patches_per_volume = 2  # Fewer patches per volume
 
 # Combined loss function and optimizer
 optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-4)
+# scheduler = ReduceLROnPlateau(optimizer, mode='max', factor=0.7, patience=3, verbose=True)
 scheduler = ReduceLROnPlateau(optimizer, mode='max', factor=0.7, patience=3)
+
 
 # Early stopping parameters
 best_dice = 0.0
 patience = 10
 counter = 0
 
-# Create datasets with augmentation
+# Create datasets
 print("Creating datasets...")
 train_dataset = LightweightGliomaDataset(
     train_img_dir, train_img_list, train_mask_dir, train_mask_list, 
     patch_size=patch_size, max_patches_per_volume=max_patches_per_volume,
-    augment=True  # Enable augmentation for training
+    is_training=True
 )
 val_dataset = LightweightGliomaDataset(
     val_img_dir, val_img_list, val_mask_dir, val_mask_list, 
     patch_size=patch_size, max_patches_per_volume=max_patches_per_volume,
-    augment=False  # No augmentation for validation
+    is_training=False
 )
 
 # Create data loaders
@@ -339,13 +332,12 @@ with mlflow.start_run():
         "batch_size": batch_size,
         "learning_rate": learning_rate,
         "model": "LightweightUNet3D",
-        "base_channels": 12,  # Updated
+        "base_channels": 8,
         "patch_size": patch_size,
         "max_patches_per_volume": max_patches_per_volume,
         "total_parameters": total_params,
         "device": str(device),
-        "loss_function": "combined_ce_dice",
-        "augmentation": True  # Added
+        "loss_function": "combined_ce_dice"
     })
     
     for epoch in range(epochs):
@@ -460,11 +452,11 @@ def evaluate_on_test_set():
     model.load_state_dict(torch.load("best_lightweight_model.pth", map_location=device))
     model.eval()
     
-    # Create test dataset (no augmentation)
+    # Create test dataset
     test_dataset = LightweightGliomaDataset(
         test_img_dir, test_img_list, test_mask_dir, test_mask_list, 
         patch_size=patch_size, max_patches_per_volume=max_patches_per_volume,
-        augment=False
+        is_training=False
     )
     test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=0)
     
